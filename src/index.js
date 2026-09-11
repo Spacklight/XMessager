@@ -1,15 +1,16 @@
 /**
  * XMessager backend — Cloudflare Worker
- * Accepts short marketing video uploads and commits them straight into a
- * Hugging Face Dataset repo using HF's Commit API (plain fetch, no SDK needed).
+ * Accepts short marketing video uploads and pushes them into a Hugging Face
+ * Dataset repo using the Git LFS batch protocol (required for binary files —
+ * HF rejects videos pushed as plain "file" commit blobs).
  *
  * Bindings expected (set in wrangler.toml / dashboard):
  *   env.HF_TOKEN         - Hugging Face access token (write scope), set as a secret
- *   env.HF_DATASET_REPO  - e.g. "yourname/xmessager-videos"
+ *   env.HF_DATASET_REPO  - e.g. "Spacklight/Video-data"
  *   env.VIDEO_KV         - (optional) KV namespace for fast video listing/metadata
  */
 
-const MAX_INLINE_BYTES = 20 * 1024 * 1024; // 20MB
+const MAX_INLINE_BYTES = 50 * 1024 * 1024; // 50MB per upload
 
 export default {
   async fetch(request, env, ctx) {
@@ -55,10 +56,7 @@ async function handleUpload(request, env, cors) {
   const buf = await file.arrayBuffer();
   if (buf.byteLength > MAX_INLINE_BYTES) {
     return json(
-      {
-        error: `File too large for this endpoint (${(buf.byteLength / 1e6).toFixed(1)}MB, limit ${MAX_INLINE_BYTES / 1e6}MB).`,
-        hint: "Large files need the Git LFS multipart upload flow instead of the inline commit API.",
-      },
+      { error: `File too large (${(buf.byteLength / 1e6).toFixed(1)}MB, limit ${MAX_INLINE_BYTES / 1e6}MB).` },
       413,
       cors
     );
@@ -68,7 +66,13 @@ async function handleUpload(request, env, cors) {
   const nameParts = (file.name || "video.mp4").split(".");
   const ext = (nameParts.length > 1 ? nameParts.pop() : "mp4").toLowerCase();
   const path = `videos/${id}.${ext}`;
-  const base64 = arrayBufferToBase64(buf);
+
+  let oid, size;
+  try {
+    ({ oid, size } = await uploadViaLfs(env, env.HF_DATASET_REPO, buf, path));
+  } catch (err) {
+    return json({ error: "Hugging Face LFS upload failed", details: err.message }, 502, cors);
+  }
 
   const commitBody =
     JSON.stringify({
@@ -76,7 +80,7 @@ async function handleUpload(request, env, cors) {
       value: { summary: `Upload video ${id}`, description: `title=${title}; uploader=${uploader}` },
     }) +
     "\n" +
-    JSON.stringify({ key: "file", value: { content: base64, path, encoding: "base64" } });
+    JSON.stringify({ key: "lfsFile", value: { path, algo: "sha256", oid, size } });
 
   const hfRes = await fetch(`https://huggingface.co/api/datasets/${env.HF_DATASET_REPO}/commit/main`, {
     method: "POST",
@@ -89,7 +93,7 @@ async function handleUpload(request, env, cors) {
 
   if (!hfRes.ok) {
     const details = await hfRes.text();
-    return json({ error: "Hugging Face upload failed", details }, hfRes.status, cors);
+    return json({ error: "Hugging Face commit failed", details }, hfRes.status, cors);
   }
 
   const videoUrl = `https://huggingface.co/datasets/${env.HF_DATASET_REPO}/resolve/main/${path}`;
@@ -100,6 +104,50 @@ async function handleUpload(request, env, cors) {
   }
 
   return json(record, 200, cors);
+}
+
+async function uploadViaLfs(env, repo, buf, path) {
+  const oid = await sha256Hex(buf);
+  const size = buf.byteLength;
+
+  const batchRes = await fetch(`https://huggingface.co/${repo}.git/info/lfs/objects/batch`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.HF_TOKEN}`,
+      Accept: "application/vnd.git-lfs+json",
+      "Content-Type": "application/vnd.git-lfs+json",
+    },
+    body: JSON.stringify({
+      operation: "upload",
+      transfers: ["basic"],
+      objects: [{ oid, size }],
+      hash_algo: "sha256",
+    }),
+  });
+
+  if (!batchRes.ok) {
+    throw new Error(`LFS batch request failed: ${await batchRes.text()}`);
+  }
+
+  const batchJson = await batchRes.json();
+  const obj = batchJson.objects && batchJson.objects[0];
+  if (!obj) throw new Error("LFS batch response missing object info");
+  if (obj.error) throw new Error(`LFS batch error: ${obj.error.message}`);
+
+  if (obj.actions && obj.actions.upload) {
+    const upload = obj.actions.upload;
+    const putRes = await fetch(upload.href, {
+      method: "PUT",
+      headers: upload.header || {},
+      body: buf,
+    });
+    if (!putRes.ok) {
+      throw new Error(`LFS object upload failed: ${putRes.status} ${await putRes.text()}`);
+    }
+  }
+  // If actions.upload is absent, HF already has this exact object (dedup) — nothing to upload.
+
+  return { oid, size };
 }
 
 async function listVideos(env, cors) {
@@ -121,14 +169,9 @@ async function listVideos(env, cors) {
   return json({ videos: files }, 200, cors);
 }
 
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
+async function sha256Hex(buffer) {
+  const hash = await crypto.subtle.digest("SHA-256", buffer);
+  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function json(obj, status, cors) {
