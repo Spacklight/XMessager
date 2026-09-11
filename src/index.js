@@ -110,7 +110,7 @@ async function uploadViaLfs(env, repo, buf, path) {
   const oid = await sha256Hex(buf);
   const size = buf.byteLength;
 
-  const batchRes = await fetch(`https://huggingface.co/${repo}.git/info/lfs/objects/batch`, {
+  const batchRes = await fetch(`https://huggingface.co/datasets/${repo}.git/info/lfs/objects/batch`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${env.HF_TOKEN}`,
