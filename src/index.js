@@ -1,5 +1,5 @@
 /**
- * XMessager backend — Cloudflare Worker
+ * XMessager backend — Cloudflare Worker (Datasets Controller / DC)
  *
  * Bindings expected:
  *   env.DB          - D1 database (binding "DB")
@@ -41,6 +41,9 @@ export default {
       if (url.pathname === "/api/videos" && request.method === "GET") return await handleFeed(request, env, cors);
       if (url.pathname === "/api/search" && request.method === "GET") return await handleSearch(request, env, cors);
 
+      const viewMatch = url.pathname.match(/^\/api\/videos\/([a-f0-9-]+)\/view$/);
+      if (viewMatch && request.method === "POST") return await handleView(viewMatch[1], env, cors);
+
       if (url.pathname === "/admin" && request.method === "GET") return adminPage(cors);
       if (url.pathname === "/api/admin/stats" && request.method === "GET") return await withAdmin(request, env, cors, adminStats);
       if (url.pathname === "/api/admin/datasets" && request.method === "GET") return await withAdmin(request, env, cors, listDatasets);
@@ -53,7 +56,7 @@ export default {
   },
 };
 
-// ---------- upload / feed / search (unchanged from before) ----------
+// ---------- upload / feed / search ----------
 
 async function handleUpload(request, env, cors) {
   if (!env.HF_TOKEN || !env.DB) return json({ error: "Server misconfigured: HF_TOKEN / DB not set" }, 500, cors);
@@ -63,6 +66,7 @@ async function handleUpload(request, env, cors) {
   const title = (form.get("title") || "untitled").toString();
   const description = (form.get("description") || "").toString();
   const uploader = (form.get("uploader") || "anonymous").toString();
+  const country = (form.get("country") || "").toString() || null;
   const forcedContinent = form.get("continent");
   const continent = normalizeContinent(forcedContinent) || request.cf?.continent || "AF";
 
@@ -106,13 +110,13 @@ async function handleUpload(request, env, cors) {
 
   await env.DB.batch([
     env.DB.prepare(
-      `INSERT INTO videos (id,title,description,continent,dataset_id,hf_repo,path,url,size_bytes,sha256,uploader,uploaded_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).bind(id, title, description, continent, dataset.id, dataset.hf_repo, path, videoUrl, size, oid, uploader, uploadedAt),
+      `INSERT INTO videos (id,title,description,continent,country,dataset_id,hf_repo,path,url,size_bytes,sha256,uploader,uploaded_at,view_count)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)`
+    ).bind(id, title, description, continent, country, dataset.id, dataset.hf_repo, path, videoUrl, size, oid, uploader, uploadedAt),
     env.DB.prepare(`UPDATE datasets SET used_bytes = used_bytes + ? WHERE id = ?`).bind(size, dataset.id),
   ]);
 
-  return json({ id, title, description, continent, url: videoUrl, size, uploadedAt }, 200, cors);
+  return json({ id, title, description, continent, country, url: videoUrl, size, uploadedAt }, 200, cors);
 }
 
 async function pickDataset(db, continent, size) {
@@ -132,26 +136,43 @@ async function pickDataset(db, continent, size) {
 async function handleFeed(request, env, cors) {
   const url = new URL(request.url);
   const continent = normalizeContinent(url.searchParams.get("continent"));
+  const country = url.searchParams.get("country");
+  const minViews = url.searchParams.get("min_views");
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10), 100);
   const offset = parseInt(url.searchParams.get("offset") || "0", 10);
 
-  const stmt = continent
-    ? env.DB.prepare(`SELECT id,title,description,url,continent,uploaded_at FROM videos WHERE continent = ? ORDER BY uploaded_at DESC LIMIT ? OFFSET ?`).bind(continent, limit, offset)
-    : env.DB.prepare(`SELECT id,title,description,url,continent,uploaded_at FROM videos ORDER BY uploaded_at DESC LIMIT ? OFFSET ?`).bind(limit, offset);
+  const cols = "id,title,description,url,continent,country,view_count,uploaded_at";
+  const clauses = [];
+  const params = [];
+  if (continent) { clauses.push("continent = ?"); params.push(continent); }
+  if (country) { clauses.push("country = ?"); params.push(country); }
+  if (minViews) { clauses.push("view_count >= ?"); params.push(parseInt(minViews, 10)); }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  params.push(limit, offset);
 
-  const { results } = await stmt.all();
+  const { results } = await env.DB.prepare(
+    `SELECT ${cols} FROM videos ${where} ORDER BY uploaded_at DESC LIMIT ? OFFSET ?`
+  ).bind(...params).all();
+
   return json({ videos: results }, 200, cors);
 }
 
 async function handleSearch(request, env, cors) {
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "30", 10), 100);
   if (!q) return json({ videos: [] }, 200, cors);
   const like = `%${q}%`;
   const { results } = await env.DB.prepare(
-    `SELECT id,title,description,url,continent,uploaded_at FROM videos WHERE title LIKE ? OR description LIKE ? ORDER BY uploaded_at DESC LIMIT 30`
-  ).bind(like, like).all();
+    `SELECT id,title,description,url,continent,country,view_count,uploaded_at FROM videos
+     WHERE title LIKE ? OR description LIKE ? ORDER BY uploaded_at DESC LIMIT ?`
+  ).bind(like, like, limit).all();
   return json({ videos: results }, 200, cors);
+}
+
+async function handleView(id, env, cors) {
+  await env.DB.prepare(`UPDATE videos SET view_count = view_count + 1 WHERE id = ?`).bind(id).run();
+  return json({ ok: true }, 200, cors);
 }
 
 async function uploadViaLfs(env, repo, buf, path) {
@@ -185,9 +206,7 @@ async function sha256Hex(buffer) {
 async function withAdmin(request, env, cors, handler, extra) {
   const auth = request.headers.get("Authorization") || "";
   const token = auth.replace(/^Bearer\s+/i, "");
-  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
-    return json({ error: "Unauthorized" }, 401, cors);
-  }
+  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) return json({ error: "Unauthorized" }, 401, cors);
   return handler(env, cors, extra);
 }
 
@@ -200,10 +219,8 @@ async function addDataset(env, cors, request) {
   const body = await request.json();
   const continent = normalizeContinent(body.continent);
   const hfRepo = (body.hf_repo || "").trim();
-  const capacityBytes = parseInt(body.capacity_bytes || 96636764160, 10); // default ~90GB, headroom under the 100GB free tier
-
+  const capacityBytes = parseInt(body.capacity_bytes || 96636764160, 10);
   if (!continent || !hfRepo) return json({ error: "continent and hf_repo are required" }, 400, cors);
-
   try {
     await env.DB.prepare(
       `INSERT INTO datasets (continent, hf_repo, capacity_bytes, used_bytes, is_active, created_at) VALUES (?,?,?,0,1,?)`
@@ -211,7 +228,6 @@ async function addDataset(env, cors, request) {
   } catch (err) {
     return json({ error: `Could not add dataset (is hf_repo already registered?): ${err.message}` }, 400, cors);
   }
-
   return json({ ok: true, continent, hf_repo: hfRepo, capacity_bytes: capacityBytes }, 200, cors);
 }
 
@@ -225,9 +241,8 @@ async function adminStats(env, cors) {
     `SELECT sha256, COUNT(*) as copies, GROUP_CONCAT(title, ' | ') as titles FROM videos GROUP BY sha256 HAVING COUNT(*) > 1`
   ).all();
   const { results: recent } = await env.DB.prepare(
-    `SELECT id, title, continent, hf_repo, size_bytes, uploaded_at FROM videos ORDER BY uploaded_at DESC LIMIT 20`
+    `SELECT id, title, continent, country, hf_repo, size_bytes, view_count, uploaded_at FROM videos ORDER BY uploaded_at DESC LIMIT 20`
   ).all();
-
   return json({ totals, perContinent, datasets, duplicates, recent }, 200, cors);
 }
 
@@ -254,7 +269,6 @@ td,th{border-bottom:1px solid #2a2d36;padding:6px;text-align:left}
 </div>
 <div id="dash" class="hidden">
 <h1>XMessager Admin Dashboard</h1>
-
 <h2>Add a dataset</h2>
 <select id="continent">
 <option value="AF">Africa</option><option value="AS">Asia</option><option value="EU">Europe</option>
@@ -264,42 +278,30 @@ td,th{border-bottom:1px solid #2a2d36;padding:6px;text-align:left}
 <input id="repo" placeholder="username/dataset-name (Hugging Face)">
 <button onclick="addDataset()">Add dataset</button>
 <p id="addMsg"></p>
-
 <h2>Datasets & usage</h2>
 <table id="dsTable"><thead><tr><th>Continent</th><th>Repo</th><th>Used</th><th></th></tr></thead><tbody></tbody></table>
-
 <h2>Overview</h2>
 <div id="overview"></div>
-
 <h2>Duplicate videos (same content, different upload)</h2>
 <table id="dupTable"><thead><tr><th>Copies</th><th>Titles</th></tr></thead><tbody></tbody></table>
-
 <h2>Recent uploads (data flow)</h2>
-<table id="recentTable"><thead><tr><th>Title</th><th>Continent</th><th>Repo</th><th>Size</th><th>When</th></tr></thead><tbody></tbody></table>
+<table id="recentTable"><thead><tr><th>Title</th><th>Continent</th><th>Country</th><th>Repo</th><th>Views</th><th>Size</th><th>When</th></tr></thead><tbody></tbody></table>
 </div>
-
 <script>
 let TOKEN = localStorage.getItem('xm_admin_token') || '';
 function fmtBytes(n){ if(!n) return '0 MB'; return (n/1e6).toFixed(1)+' MB'; }
 function fmtDate(ts){ return new Date(ts).toLocaleString(); }
-
 async function api(path, opts={}) {
   const res = await fetch(path, { ...opts, headers: { ...(opts.headers||{}), Authorization: 'Bearer '+TOKEN } });
   if (res.status === 401) { localStorage.removeItem('xm_admin_token'); document.getElementById('login').classList.remove('hidden'); document.getElementById('dash').classList.add('hidden'); throw new Error('Unauthorized'); }
   return res.json();
 }
-
 async function doLogin(){
   TOKEN = document.getElementById('tok').value;
-  try {
-    await api('/api/admin/stats');
-    localStorage.setItem('xm_admin_token', TOKEN);
-    document.getElementById('login').classList.add('hidden');
-    document.getElementById('dash').classList.remove('hidden');
-    loadAll();
+  try { await api('/api/admin/stats'); localStorage.setItem('xm_admin_token', TOKEN);
+    document.getElementById('login').classList.add('hidden'); document.getElementById('dash').classList.remove('hidden'); loadAll();
   } catch(e) { alert('Wrong token'); }
 }
-
 async function addDataset(){
   const continent = document.getElementById('continent').value;
   const hf_repo = document.getElementById('repo').value.trim();
@@ -308,10 +310,8 @@ async function addDataset(){
   document.getElementById('addMsg').textContent = r.error ? ('Error: '+r.error) : ('Added '+r.hf_repo+' for '+r.continent);
   loadAll();
 }
-
 async function loadAll(){
   const stats = await api('/api/admin/stats');
-
   const dsBody = document.querySelector('#dsTable tbody'); dsBody.innerHTML='';
   stats.datasets.forEach(d=>{
     const pct = Math.min(100, Math.round((d.used_bytes/d.capacity_bytes)*100));
@@ -319,21 +319,17 @@ async function loadAll(){
       <td>\${fmtBytes(d.used_bytes)} / \${fmtBytes(d.capacity_bytes)}<div class="bar"><div style="width:\${pct}%"></div></div></td>
       <td>\${d.is_active? 'active':'inactive'}</td></tr>\`;
   });
-
   const totalMB = fmtBytes(stats.totals.totalBytes);
   let overviewHtml = \`<p>\${stats.totals.videoCount} videos total, \${totalMB} stored.</p><ul>\`;
   stats.perContinent.forEach(c=>{ overviewHtml += \`<li>\${c.continent}: \${c.videoCount} videos, \${fmtBytes(c.totalBytes)}</li>\`; });
   overviewHtml += '</ul>';
   document.getElementById('overview').innerHTML = overviewHtml;
-
   const dupBody = document.querySelector('#dupTable tbody'); dupBody.innerHTML = stats.duplicates.length
     ? stats.duplicates.map(d=>\`<tr><td>\${d.copies}</td><td>\${d.titles}</td></tr>\`).join('')
     : '<tr><td colspan="2">No duplicates found.</td></tr>';
-
   const recBody = document.querySelector('#recentTable tbody');
-  recBody.innerHTML = stats.recent.map(v=>\`<tr><td>\${v.title}</td><td>\${v.continent}</td><td>\${v.hf_repo}</td><td>\${fmtBytes(v.size_bytes)}</td><td>\${fmtDate(v.uploaded_at)}</td></tr>\`).join('');
+  recBody.innerHTML = stats.recent.map(v=>\`<tr><td>\${v.title}</td><td>\${v.continent}</td><td>\${v.country||''}</td><td>\${v.hf_repo}</td><td>\${v.view_count}</td><td>\${fmtBytes(v.size_bytes)}</td><td>\${fmtDate(v.uploaded_at)}</td></tr>\`).join('');
 }
-
 if (TOKEN) { document.getElementById('login').classList.add('hidden'); document.getElementById('dash').classList.remove('hidden'); loadAll().catch(()=>{}); }
 </script>
 </body></html>`;
