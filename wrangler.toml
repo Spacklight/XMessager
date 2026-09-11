@@ -2,14 +2,10 @@ name = "xmessager-backend"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
-# Optional KV namespace for fast video metadata listing.
-# Create it with: wrangler kv namespace create VIDEO_KV
-# then paste the id below (and uncomment).
-# [[kv_namespaces]]
-# binding = "VIDEO_KV"
-# id = "REPLACE_WITH_KV_NAMESPACE_ID"
+[[d1_databases]]
+binding = "DB"
+database_name = "xmessager-db"
+database_id = "592e201c-44e9-42a0-8c09-e9a4fea1b834"
 
-# Non-secret vars go here. HF_TOKEN must NOT go here — it goes in as a
-# Cloudflare *secret* instead (we'll set that in the dashboard later).
 [vars]
 HF_DATASET_REPO = "Spacklight/Video-data"
