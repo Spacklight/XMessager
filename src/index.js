@@ -44,6 +44,17 @@ export default {
       const viewMatch = url.pathname.match(/^\/api\/videos\/([a-f0-9-]+)\/view$/);
       if (viewMatch && request.method === "POST") return await handleView(viewMatch[1], env, cors);
 
+      const likeMatch = url.pathname.match(/^\/api\/videos\/([a-f0-9-]+)\/like$/);
+      if (likeMatch && request.method === "POST") return await handleLike(likeMatch[1], request, env, cors);
+      const saveMatch = url.pathname.match(/^\/api\/videos\/([a-f0-9-]+)\/save$/);
+      if (saveMatch && request.method === "POST") return await handleSave(saveMatch[1], request, env, cors);
+      const shareMatch = url.pathname.match(/^\/api\/videos\/([a-f0-9-]+)\/share$/);
+      if (shareMatch && request.method === "POST") return await handleShare(shareMatch[1], env, cors);
+      const commentMatch = url.pathname.match(/^\/api\/videos\/([a-f0-9-]+)\/comments$/);
+      if (commentMatch && request.method === "GET") return await listVideoComments(commentMatch[1], env, cors);
+      if (commentMatch && request.method === "POST") return await addVideoComment(commentMatch[1], request, env, cors);
+      if (url.pathname === "/api/videos/follow" && request.method === "POST") return await handleFollow(request, env, cors);
+
       if (url.pathname === "/admin" && request.method === "GET") return adminPage(cors);
       if (url.pathname === "/api/admin/stats" && request.method === "GET") return await withAdmin(request, env, cors, adminStats);
       if (url.pathname === "/api/admin/datasets" && request.method === "GET") return await withAdmin(request, env, cors, listDatasets);
@@ -69,6 +80,14 @@ async function handleUpload(request, env, cors) {
   const country = (form.get("country") || "").toString() || null;
   const forcedContinent = form.get("continent");
   const continent = normalizeContinent(forcedContinent) || request.cf?.continent || "AF";
+  const category = (form.get("category") || "").toString() || null;
+  const uploaderType = form.get("uploader_type") === "page" ? "page" : "individual";
+  const uploaderUserId = (form.get("uploader_user_id") || "").toString() || null;
+  const pageId = (form.get("page_id") || "").toString() || null;
+  const pageName = (form.get("page_name") || "").toString() || null;
+  const locationDescription = (form.get("location_description") || "").toString() || null;
+  const locationLat = form.get("location_lat") ? parseFloat(form.get("location_lat")) : null;
+  const locationLng = form.get("location_lng") ? parseFloat(form.get("location_lng")) : null;
 
   if (!file || typeof file === "string") return json({ error: "No video file provided (multipart field name: 'video')" }, 400, cors);
 
@@ -110,13 +129,13 @@ async function handleUpload(request, env, cors) {
 
   await env.DB.batch([
     env.DB.prepare(
-      `INSERT INTO videos (id,title,description,continent,country,dataset_id,hf_repo,path,url,size_bytes,sha256,uploader,uploaded_at,view_count)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)`
-    ).bind(id, title, description, continent, country, dataset.id, dataset.hf_repo, path, videoUrl, size, oid, uploader, uploadedAt),
+      `INSERT INTO videos (id,title,description,continent,country,dataset_id,hf_repo,path,url,size_bytes,sha256,uploader,uploaded_at,view_count,category,uploader_type,uploader_user_id,page_id,page_name,location_description,location_lat,location_lng,share_count)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,0)`
+    ).bind(id, title, description, continent, country, dataset.id, dataset.hf_repo, path, videoUrl, size, oid, uploader, uploadedAt, category, uploaderType, uploaderUserId, pageId, pageName, locationDescription, locationLat, locationLng),
     env.DB.prepare(`UPDATE datasets SET used_bytes = used_bytes + ? WHERE id = ?`).bind(size, dataset.id),
   ]);
 
-  return json({ id, title, description, continent, country, url: videoUrl, size, uploadedAt }, 200, cors);
+  return json({ id, title, description, continent, country, category, uploader_type: uploaderType, page_id: pageId, page_name: pageName, url: videoUrl, size, uploadedAt }, 200, cors);
 }
 
 async function pickDataset(db, continent, size) {
@@ -138,20 +157,34 @@ async function handleFeed(request, env, cors) {
   const continent = normalizeContinent(url.searchParams.get("continent"));
   const country = url.searchParams.get("country");
   const minViews = url.searchParams.get("min_views");
+  const category = url.searchParams.get("category");
+  const viewerId = url.searchParams.get("user_id");
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10), 100);
   const offset = parseInt(url.searchParams.get("offset") || "0", 10);
 
-  const cols = "id,title,description,url,continent,country,view_count,uploaded_at";
-  const clauses = [];
   const params = [];
-  if (continent) { clauses.push("continent = ?"); params.push(continent); }
-  if (country) { clauses.push("country = ?"); params.push(country); }
-  if (minViews) { clauses.push("view_count >= ?"); params.push(parseInt(minViews, 10)); }
+  let likedSelect = "0 as liked_by_me, 0 as saved_by_me";
+  if (viewerId) {
+    likedSelect = `(SELECT COUNT(*) FROM video_likes l2 WHERE l2.video_id=v.id AND l2.user_id=?) as liked_by_me,
+      (SELECT COUNT(*) FROM video_saves s2 WHERE s2.video_id=v.id AND s2.user_id=?) as saved_by_me`;
+    params.push(viewerId, viewerId);
+  }
+  const cols = `v.*,
+    (SELECT COUNT(*) FROM video_likes l WHERE l.video_id=v.id) as like_count,
+    (SELECT COUNT(*) FROM video_comments c WHERE c.video_id=v.id) as comment_count,
+    (SELECT COUNT(*) FROM video_saves s WHERE s.video_id=v.id) as save_count,
+    ${likedSelect}`;
+
+  const clauses = [];
+  if (continent) { clauses.push("v.continent = ?"); params.push(continent); }
+  if (country) { clauses.push("v.country = ?"); params.push(country); }
+  if (minViews) { clauses.push("v.view_count >= ?"); params.push(parseInt(minViews, 10)); }
+  if (category) { clauses.push("v.category = ?"); params.push(category); }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   params.push(limit, offset);
 
   const { results } = await env.DB.prepare(
-    `SELECT ${cols} FROM videos ${where} ORDER BY uploaded_at DESC LIMIT ? OFFSET ?`
+    `SELECT ${cols} FROM videos v ${where} ORDER BY v.uploaded_at DESC LIMIT ? OFFSET ?`
   ).bind(...params).all();
 
   return json({ videos: results }, 200, cors);
@@ -161,12 +194,27 @@ async function handleSearch(request, env, cors) {
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "30", 10), 100);
+  const viewerId = url.searchParams.get("user_id");
   if (!q) return json({ videos: [] }, 200, cors);
   const like = `%${q}%`;
+
+  const params = [];
+  let likedSelect = "0 as liked_by_me, 0 as saved_by_me";
+  if (viewerId) {
+    likedSelect = `(SELECT COUNT(*) FROM video_likes l2 WHERE l2.video_id=v.id AND l2.user_id=?) as liked_by_me,
+      (SELECT COUNT(*) FROM video_saves s2 WHERE s2.video_id=v.id AND s2.user_id=?) as saved_by_me`;
+    params.push(viewerId, viewerId);
+  }
+  const cols = `v.*,
+    (SELECT COUNT(*) FROM video_likes l WHERE l.video_id=v.id) as like_count,
+    (SELECT COUNT(*) FROM video_comments c WHERE c.video_id=v.id) as comment_count,
+    (SELECT COUNT(*) FROM video_saves s WHERE s.video_id=v.id) as save_count,
+    ${likedSelect}`;
+  params.push(like, like, limit);
+
   const { results } = await env.DB.prepare(
-    `SELECT id,title,description,url,continent,country,view_count,uploaded_at FROM videos
-     WHERE title LIKE ? OR description LIKE ? ORDER BY uploaded_at DESC LIMIT ?`
-  ).bind(like, like, limit).all();
+    `SELECT ${cols} FROM videos v WHERE v.title LIKE ? OR v.description LIKE ? ORDER BY v.uploaded_at DESC LIMIT ?`
+  ).bind(...params).all();
   return json({ videos: results }, 200, cors);
 }
 
@@ -334,6 +382,67 @@ if (TOKEN) { document.getElementById('login').classList.add('hidden'); document.
 </script>
 </body></html>`;
   return new Response(html, { headers: { ...cors, "Content-Type": "text/html;charset=utf-8" } });
+}
+
+async function handleLike(id, request, env, cors) {
+  const body = await request.json().catch(() => ({}));
+  const userId = body.user_id;
+  if (!userId) return json({ error: "user_id is required" }, 400, cors);
+  const existing = await env.DB.prepare(`SELECT * FROM video_likes WHERE video_id=? AND user_id=?`).bind(id, userId).first();
+  if (existing) await env.DB.prepare(`DELETE FROM video_likes WHERE video_id=? AND user_id=?`).bind(id, userId).run();
+  else await env.DB.prepare(`INSERT INTO video_likes (video_id,user_id,created_at) VALUES (?,?,?)`).bind(id, userId, Date.now()).run();
+  const row = await env.DB.prepare(`SELECT COUNT(*) as c FROM video_likes WHERE video_id=?`).bind(id).first();
+  return json({ liked: !existing, like_count: row.c }, 200, cors);
+}
+
+async function handleSave(id, request, env, cors) {
+  const body = await request.json().catch(() => ({}));
+  const userId = body.user_id;
+  if (!userId) return json({ error: "user_id is required" }, 400, cors);
+  const existing = await env.DB.prepare(`SELECT * FROM video_saves WHERE video_id=? AND user_id=?`).bind(id, userId).first();
+  if (existing) await env.DB.prepare(`DELETE FROM video_saves WHERE video_id=? AND user_id=?`).bind(id, userId).run();
+  else await env.DB.prepare(`INSERT INTO video_saves (video_id,user_id,created_at) VALUES (?,?,?)`).bind(id, userId, Date.now()).run();
+  const row = await env.DB.prepare(`SELECT COUNT(*) as c FROM video_saves WHERE video_id=?`).bind(id).first();
+  return json({ saved: !existing, save_count: row.c }, 200, cors);
+}
+
+async function handleShare(id, env, cors) {
+  await env.DB.prepare(`UPDATE videos SET share_count = share_count + 1 WHERE id=?`).bind(id).run();
+  return json({ ok: true }, 200, cors);
+}
+
+async function listVideoComments(id, env, cors) {
+  const { results } = await env.DB.prepare(`SELECT * FROM video_comments WHERE video_id=? ORDER BY created_at ASC LIMIT 100`).bind(id).all();
+  return json({ comments: results }, 200, cors);
+}
+
+async function addVideoComment(id, request, env, cors) {
+  const body = await request.json().catch(() => ({}));
+  const userId = body.user_id;
+  const userName = body.user_name || "User";
+  const content = (body.content || "").trim();
+  if (!userId || !content) return json({ error: "user_id and content are required" }, 400, cors);
+  const cid = crypto.randomUUID();
+  const createdAt = Date.now();
+  await env.DB.prepare(`INSERT INTO video_comments (id,video_id,user_id,user_name,content,created_at) VALUES (?,?,?,?,?,?)`)
+    .bind(cid, id, userId, userName, content, createdAt).run();
+  return json({ id: cid, video_id: id, user_id: userId, user_name: userName, content, created_at: createdAt }, 200, cors);
+}
+
+async function handleFollow(request, env, cors) {
+  const body = await request.json().catch(() => ({}));
+  const { followed_type, followed_id, follower_user_id } = body;
+  if (!followed_type || !followed_id || !follower_user_id) return json({ error: "followed_type, followed_id, follower_user_id are required" }, 400, cors);
+  const existing = await env.DB.prepare(`SELECT * FROM video_follows WHERE followed_type=? AND followed_id=? AND follower_user_id=?`)
+    .bind(followed_type, followed_id, follower_user_id).first();
+  if (existing) {
+    await env.DB.prepare(`DELETE FROM video_follows WHERE followed_type=? AND followed_id=? AND follower_user_id=?`)
+      .bind(followed_type, followed_id, follower_user_id).run();
+  } else {
+    await env.DB.prepare(`INSERT INTO video_follows (followed_type,followed_id,follower_user_id,created_at) VALUES (?,?,?,?)`)
+      .bind(followed_type, followed_id, follower_user_id, Date.now()).run();
+  }
+  return json({ following: !existing }, 200, cors);
 }
 
 function json(obj, status, cors) {
