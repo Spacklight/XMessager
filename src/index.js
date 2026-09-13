@@ -188,8 +188,17 @@ async function handleFeed(request, env, cors) {
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   params.push(limit, offset);
 
+  // Rank by a blend of recency and engagement: newer + more-liked/viewed videos
+  // score higher, but the score decays over time so old viral videos don't
+  // permanently dominate the feed.
+  const rankExpr = `
+    (like_count*3 + v.view_count + 1) /
+    ( (((strftime('%s','now')*1000 - v.uploaded_at)/3600000.0) + 2) *
+      (((strftime('%s','now')*1000 - v.uploaded_at)/3600000.0) + 2) )
+  `;
+
   const { results } = await env.DB.prepare(
-    `SELECT ${cols} FROM videos v ${where} ORDER BY v.uploaded_at DESC LIMIT ? OFFSET ?`
+    `SELECT ${cols} FROM videos v ${where} ORDER BY ${rankExpr} DESC LIMIT ? OFFSET ?`
   ).bind(...params).all();
 
   return json({ videos: results }, 200, cors);
