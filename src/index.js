@@ -54,6 +54,7 @@ export default {
       if (commentMatch && request.method === "GET") return await listVideoComments(commentMatch[1], env, cors);
       if (commentMatch && request.method === "POST") return await addVideoComment(commentMatch[1], request, env, cors);
       if (url.pathname === "/api/videos/follow" && request.method === "POST") return await handleFollow(request, env, cors);
+      if (url.pathname === "/api/my/stats" && request.method === "GET") return await myVideoStats(request, env, cors);
 
       if (url.pathname === "/admin" && request.method === "GET") return adminPage(cors);
       if (url.pathname === "/api/admin/stats" && request.method === "GET") return await withAdmin(request, env, cors, adminStats);
@@ -443,6 +444,51 @@ async function handleFollow(request, env, cors) {
       .bind(followed_type, followed_id, follower_user_id, Date.now()).run();
   }
   return json({ following: !existing }, 200, cors);
+}
+
+async function myVideoStats(request, env, cors) {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get("user_id");
+  const pageIds = (url.searchParams.get("page_ids") || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (!userId) return json({ error: "user_id is required" }, 400, cors);
+
+  let sql = `SELECT v.*,
+      (SELECT COUNT(*) FROM video_likes l WHERE l.video_id=v.id) as like_count,
+      (SELECT COUNT(*) FROM video_comments c WHERE c.video_id=v.id) as comment_count,
+      (SELECT COUNT(*) FROM video_saves s WHERE s.video_id=v.id) as save_count
+    FROM videos v WHERE v.uploader_user_id = ?`;
+  const params = [userId];
+  if (pageIds.length) {
+    sql += ` OR v.page_id IN (${pageIds.map(() => "?").join(",")})`;
+    params.push(...pageIds);
+  }
+  sql += ` ORDER BY v.uploaded_at DESC LIMIT 100`;
+  const { results: videos } = await env.DB.prepare(sql).bind(...params).all();
+
+  const indivRow = await env.DB.prepare(
+    `SELECT COUNT(*) as c FROM video_follows WHERE followed_type='individual' AND followed_id=?`
+  ).bind(userId).first();
+
+  const pageFollowers = {};
+  for (const pid of pageIds) {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) as c FROM video_follows WHERE followed_type='page' AND followed_id=?`
+    ).bind(pid).first();
+    pageFollowers[pid] = row.c;
+  }
+
+  const totalFollowers = indivRow.c + Object.values(pageFollowers).reduce((a, b) => a + b, 0);
+  const totalViews = videos.reduce((a, v) => a + (v.view_count || 0), 0);
+  const totalLikes = videos.reduce((a, v) => a + (v.like_count || 0), 0);
+
+  return json({
+    individual_followers: indivRow.c,
+    page_followers: pageFollowers,
+    total_followers: totalFollowers,
+    total_views: totalViews,
+    total_likes: totalLikes,
+    videos,
+  }, 200, cors);
 }
 
 function json(obj, status, cors) {
