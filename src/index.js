@@ -164,11 +164,15 @@ async function handleFeed(request, env, cors) {
   const offset = parseInt(url.searchParams.get("offset") || "0", 10);
 
   const params = [];
-  let likedSelect = "0 as liked_by_me, 0 as saved_by_me";
+  let likedSelect = "0 as liked_by_me, 0 as saved_by_me, 0 as is_following";
   if (viewerId) {
     likedSelect = `(SELECT COUNT(*) FROM video_likes l2 WHERE l2.video_id=v.id AND l2.user_id=?) as liked_by_me,
-      (SELECT COUNT(*) FROM video_saves s2 WHERE s2.video_id=v.id AND s2.user_id=?) as saved_by_me`;
-    params.push(viewerId, viewerId);
+      (SELECT COUNT(*) FROM video_saves s2 WHERE s2.video_id=v.id AND s2.user_id=?) as saved_by_me,
+      (SELECT COUNT(*) FROM video_follows f WHERE f.follower_user_id=? AND (
+        (v.uploader_type='page' AND f.followed_type='page' AND f.followed_id=v.page_id) OR
+        (v.uploader_type='individual' AND f.followed_type='individual' AND f.followed_id=v.uploader_user_id)
+      )) as is_following`;
+    params.push(viewerId, viewerId, viewerId);
   }
   const cols = `v.*,
     (SELECT COUNT(*) FROM video_likes l WHERE l.video_id=v.id) as like_count,
@@ -200,11 +204,15 @@ async function handleSearch(request, env, cors) {
   const like = `%${q}%`;
 
   const params = [];
-  let likedSelect = "0 as liked_by_me, 0 as saved_by_me";
+  let likedSelect = "0 as liked_by_me, 0 as saved_by_me, 0 as is_following";
   if (viewerId) {
     likedSelect = `(SELECT COUNT(*) FROM video_likes l2 WHERE l2.video_id=v.id AND l2.user_id=?) as liked_by_me,
-      (SELECT COUNT(*) FROM video_saves s2 WHERE s2.video_id=v.id AND s2.user_id=?) as saved_by_me`;
-    params.push(viewerId, viewerId);
+      (SELECT COUNT(*) FROM video_saves s2 WHERE s2.video_id=v.id AND s2.user_id=?) as saved_by_me,
+      (SELECT COUNT(*) FROM video_follows f WHERE f.follower_user_id=? AND (
+        (v.uploader_type='page' AND f.followed_type='page' AND f.followed_id=v.page_id) OR
+        (v.uploader_type='individual' AND f.followed_type='individual' AND f.followed_id=v.uploader_user_id)
+      )) as is_following`;
+    params.push(viewerId, viewerId, viewerId);
   }
   const cols = `v.*,
     (SELECT COUNT(*) FROM video_likes l WHERE l.video_id=v.id) as like_count,
